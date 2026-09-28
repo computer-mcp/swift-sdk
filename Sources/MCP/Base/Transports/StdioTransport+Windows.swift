@@ -88,8 +88,12 @@
 
     public func receive() -> AsyncThrowingStream<Data, any Error> {
       let mailbox = mailbox
-      return AsyncThrowingStream(unfolding: { [weak self] in
-        try await withTaskCancellationHandler {
+      let lifetime = WindowsStdioReceiveLifetime { [weak self] in
+        Task { [weak self] in await self?.disconnect() }
+      }
+      return AsyncThrowingStream(unfolding: { [weak self, lifetime] in
+        defer { withExtendedLifetime(lifetime) {} }
+        return try await withTaskCancellationHandler {
           try await mailbox.next()
         } onCancel: { [weak self] in
           Task { [weak self] in await self?.disconnect() }
@@ -205,5 +209,15 @@
         withExtendedLifetime(owned) {}
       }
     }
+  }
+
+  /// A pre-cancelled unfolding stream discards its producer without invoking it.
+  /// Producer release must retire native I/O even when its cancellation handler never ran.
+  private final class WindowsStdioReceiveLifetime: Sendable {
+    private let finish: @Sendable () -> Void
+
+    init(_ finish: @escaping @Sendable () -> Void) { self.finish = finish }
+
+    deinit { finish() }
   }
 #endif
