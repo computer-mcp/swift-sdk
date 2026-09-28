@@ -30,11 +30,18 @@ Windows. Platform validation must identify the actual product and transport.
 
 ## Adoption and validation
 
-Downstream packages adopt an exact fetchable commit from
-`https://github.com/computer-mcp/swift-sdk.git` and record it in their dependency
-lock. A local source override or a patch applied during a test is not a shipping
-dependency. Upstream tags retain their upstream identity; this fork does not
-move or replace them.
+Downstream packages declare an exact release version from
+`https://github.com/computer-mcp/swift-sdk.git` and record its commit in their
+dependency lock. Versioned SwiftPM packages require version-based dependencies.
+A local source override or a patch applied during a test is not a shipping
+dependency.
+
+Fork releases use the `computer-mcp.N` prerelease suffix to distinguish their
+identity from upstream releases. During `0.x`, new platform capabilities advance
+the minor version; compatible fixes advance the patch version. Each release
+identifies its upstream base, exact source commit, native validation and scope
+limits. Tags are signed and immutable. Upstream tags retain their upstream
+identity; this fork does not move or replace them.
 
 Run `swift build` and `swift test` for the complete supported native package.
 Transport regression coverage lives in `Tests/MCPTests`, including real Windows
