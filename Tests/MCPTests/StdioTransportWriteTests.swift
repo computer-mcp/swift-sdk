@@ -42,7 +42,7 @@ import Testing
                 }
                 try await first.value
                 for task in others { try await task.value }
-                let lines = received.split(separator: UInt8(ascii: "\n")).map(Data.init)
+                let lines: [Data] = received.split(separator: UInt8(ascii: "\n"))
                 #expect(lines.count == small.count + 1)
                 #expect(lines.first == large)
                 #expect(Set(lines.dropFirst()) == Set(small))
