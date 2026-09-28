@@ -1,0 +1,56 @@
+name: Maintained transport validation
+
+on:
+  push:
+    branches: ['codex/**']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  macos:
+    runs-on: macos-26
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: Build and test the complete native package
+        run: |
+          mkdir -p .build/transport-evidence
+          swift --version > .build/transport-evidence/toolchain.txt
+          swift build --disable-automatic-resolution > .build/transport-evidence/build.log 2>&1
+          swift test --disable-automatic-resolution > .build/transport-evidence/tests.log 2>&1
+          git diff --exit-code -- Package.resolved
+      - name: Preserve native package results
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: macos-transports-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .build/transport-evidence/
+          if-no-files-found: error
+
+  windows:
+    runs-on: windows-2022
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: compnerd/gha-setup-swift@bbae8ce86bac5a3449f3992b3d88bc4ca25f2057
+        with:
+          swift-version: swift-6.2.3-release
+          swift-build: 6.2.3-RELEASE
+      - name: Test the complete MCP library with native transports
+        shell: pwsh
+        run: ./Tests/WindowsIntegration/Validate.ps1
+      - name: Preserve native transport results
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: windows-transports-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .build/windows-transports/evidence/
+          include-hidden-files: true
+          if-no-files-found: error

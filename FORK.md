@@ -38,7 +38,9 @@ move or replace them.
 
 Run `swift build` and `swift test` for the complete supported native package.
 Transport regression coverage lives in `Tests/MCPTests`, including real Windows
-pipe ownership and POSIX concurrent-write cases. Downstream native Windows jobs
+pipe ownership and POSIX concurrent-write cases. The maintained transport CI
+runs the full macOS package and the native Windows consumer described in
+`Tests/WindowsIntegration/README.md`. Downstream native Windows jobs
 also exercise complete standard MCP connections and process cleanup with the
 exact dependency revision. A build or fixture success does not prove model
 authentication or installed-application acceptance.

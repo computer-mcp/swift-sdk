@@ -1,0 +1,19 @@
+// swift-tools-version: 6.2
+import PackageDescription
+
+let package = Package(
+  name: "MCPNativeTransportValidation",
+  dependencies: [
+    .package(name: "swift-sdk", path: "__MCP_SOURCE__"),
+    .package(url: "https://github.com/apple/swift-log.git", from: "1.5.0"),
+    .package(url: "https://github.com/apple/swift-system.git", from: "1.0.0"),
+  ],
+  targets: [
+    .testTarget(
+      name: "MCPNativeTransportTests",
+      dependencies: [
+        .product(name: "MCP", package: "swift-sdk"),
+        .product(name: "Logging", package: "swift-log"),
+        .product(name: "SystemPackage", package: "swift-system"),
+      ], path: "Tests")
+  ])
