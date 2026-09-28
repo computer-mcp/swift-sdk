@@ -1,6 +1,7 @@
 import Logging
 
 import struct Foundation.Data
+import struct Foundation.UUID
 
 #if canImport(System)
     import System
@@ -54,6 +55,8 @@ import struct Foundation.Data
         public nonisolated let logger: Logger
 
         private var isConnected = false
+        private var writeGeneration = UUID()
+        private var sendTail: (id: UUID, task: Task<Void, Swift.Error>)?
         private let messageStream: AsyncThrowingStream<Data, Swift.Error>
         private let messageContinuation: AsyncThrowingStream<Data, Swift.Error>.Continuation
 
@@ -95,6 +98,7 @@ import struct Foundation.Data
             try setNonBlocking(fileDescriptor: input)
             try setNonBlocking(fileDescriptor: output)
 
+            writeGeneration = UUID()
             isConnected = true
             logger.debug("Transport connected successfully")
 
@@ -180,9 +184,12 @@ import struct Foundation.Data
         ///
         /// This stops the message reading loop and releases associated resources.
         public func disconnect() async {
-            guard isConnected else { return }
             isConnected = false
+            writeGeneration = UUID()
             messageContinuation.finish()
+            // Pending frames observe retirement before writing; join the accepted tail.
+            let pending = sendTail
+            _ = await pending?.task.result
             logger.debug("Transport disconnected")
         }
 
@@ -195,29 +202,61 @@ import struct Foundation.Data
         /// - Parameter message: The message data to send (without a trailing newline)
         /// - Throws: Error if the message cannot be sent
         public func send(_ message: Data) async throws {
+            try Task.checkCancellation()
             guard isConnected else {
                 throw MCPError.transportError(Errno(rawValue: ENOTCONN))
             }
+            let generation = writeGeneration
+            let predecessor = sendTail?.task
+            let id = UUID()
+            // Nonblocking writes suspend on backpressure. Keep complete frames ordered
+            // across those suspension points, including the newline delimiter.
+            let task = Task {
+                _ = await predecessor?.result
+                try Task.checkCancellation()
+                try await writeFrame(message, generation: generation)
+            }
+            sendTail = (id, task)
+            defer { if sendTail?.id == id { sendTail = nil } }
+            try await withTaskCancellationHandler {
+                try await task.value
+            } onCancel: {
+                task.cancel()
+            }
+        }
 
-            // Add newline as delimiter
-            var messageWithNewline = message
-            messageWithNewline.append(UInt8(ascii: "\n"))
-
-            var remaining = messageWithNewline
-            while !remaining.isEmpty {
-                do {
-                    let written = try remaining.withUnsafeBytes { buffer in
-                        try output.write(UnsafeRawBufferPointer(buffer))
+        private func writeFrame(_ message: Data, generation: UUID) async throws {
+            var frame = message
+            frame.append(UInt8(ascii: "\n"))
+            var offset = 0
+            do {
+                while offset < frame.count {
+                    try Task.checkCancellation()
+                    guard isConnected, writeGeneration == generation else {
+                        throw MCPError.transportError(Errno(rawValue: ENOTCONN))
                     }
-                    if written > 0 {
-                        remaining = remaining.dropFirst(written)
+                    do {
+                        let written = try frame.withUnsafeBytes { buffer in
+                            try output.write(UnsafeRawBufferPointer(rebasing: buffer[offset...]))
+                        }
+                        guard written > 0 else { throw Errno(rawValue: EIO) }
+                        offset += written
+                    } catch let error where MCPError.isResourceTemporarilyUnavailable(error) {
+                        try await Task.sleep(for: .milliseconds(10))
                     }
-                } catch let error where MCPError.isResourceTemporarilyUnavailable(error) {
-                    try await Task.sleep(for: .milliseconds(10))
-                    continue
-                } catch {
-                    throw MCPError.transportError(error)
                 }
+            } catch {
+                // A partial frame cannot be followed by another message. Cancellation
+                // before writing any bytes leaves the connection reusable.
+                if writeGeneration == generation,
+                    offset > 0 || !(error is CancellationError)
+                {
+                    isConnected = false
+                    writeGeneration = UUID()
+                    messageContinuation.finish(throwing: error)
+                }
+                if error is CancellationError { throw error }
+                throw MCPError.transportError(error)
             }
         }
 
