@@ -1,6 +1,8 @@
 # MCP Swift SDK
 
-Official Swift SDK for the [Model Context Protocol][mcp] (MCP).
+Computer MCP's transport fork of the official Swift SDK for the
+[Model Context Protocol][mcp] (MCP). See [fork ownership and scope](FORK.md)
+for the upstream identity, platform boundaries and downstream adoption policy.
 
 ## Overview
 
