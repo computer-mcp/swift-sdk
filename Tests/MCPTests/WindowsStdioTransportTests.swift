@@ -19,7 +19,7 @@
         input: response.reader.descriptor, output: request.writer.descriptor)
       let server = Server(name: "native-pipe", version: "1", capabilities: .init(tools: .init()))
       await server.withMethodHandler(CallTool.self) { request in
-        CallTool.Result(
+        try CallTool.Result(
           content: [],
           structuredContent: Value.object(["echo": request.arguments?["value"] ?? .null]))
       }
