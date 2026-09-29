@@ -93,6 +93,12 @@ extension Value: Codable {
         } else if let value = try? container.decode(Int.self) {
             self = .int(value)
         } else if let value = try? container.decode(Double.self) {
+            // An integral fallback may already have rounded an out-of-range
+            // JSON integer, so its original identity cannot be recovered.
+            guard value.isFinite, value.rounded() != value else {
+                throw DecodingError.dataCorruptedError(
+                    in: container, debugDescription: "JSON integer is outside the supported Int range")
+            }
             self = .double(value)
         } else if let value = try? container.decode(String.self) {
             if Data.isDataURL(string: value),
@@ -123,7 +129,18 @@ extension Value: Codable {
         case .int(let value):
             try container.encode(value)
         case .double(let value):
-            try container.encode(value)
+            if let integer = Int(exactly: value) {
+                try container.encode(integer)
+            } else {
+                guard value.isFinite, value.rounded() != value else {
+                    throw EncodingError.invalidValue(
+                        value,
+                        .init(
+                            codingPath: encoder.codingPath,
+                            debugDescription: "JSON integer is outside the supported Int range"))
+                }
+                try container.encode(value)
+            }
         case .string(let value):
             try container.encode(value)
         case let .data(mimeType, value):

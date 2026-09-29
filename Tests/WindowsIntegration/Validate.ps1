@@ -25,7 +25,7 @@ $manifest | Set-Content (Join-Path $consumer 'Package.swift')
 Copy-Item (Join-Path $source 'Package.resolved') (Join-Path $consumer 'Package.resolved')
 $testDirectory = Join-Path $consumer 'Tests'
 New-Item -ItemType Directory -Path $testDirectory | Out-Null
-$testSources = @('InMemoryTransportTests.swift', 'WindowsStdioTransportTests.swift')
+$testSources = @('InMemoryTransportTests.swift', 'WindowsStdioTransportTests.swift', 'ValueIntegerTests.swift')
 $testHashes = foreach ($name in $testSources) {
     $original = Join-Path $source "Tests/MCPTests/$name"
     $copy = Join-Path $testDirectory $name

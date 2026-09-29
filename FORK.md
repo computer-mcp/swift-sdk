@@ -1,4 +1,4 @@
-# Transport fork
+# MCP compatibility fork
 
 Computer MCP maintains this fork of
 [modelcontextprotocol/swift-sdk](https://github.com/modelcontextprotocol/swift-sdk).
@@ -9,7 +9,7 @@ repository. This fork is not an upstream release.
 
 ## Owned changes
 
-The MCP transport layer owns the following behavior:
+The fork owns the following transport and JSON interoperability behavior:
 
 - HTTP client EventSource use is conditional on its supported Apple platforms;
   other platforms retain the existing non-EventSource HTTP path.
@@ -18,6 +18,11 @@ The MCP transport layer owns the following behavior:
   closes its transport and wakes retained work.
 - POSIX stdio serializes complete frames across concurrent senders, including
   partial writes and backpressure. Disconnect releases pending writers.
+- JSON values preserve integers within the platform's signed Int range. An
+  unsupported integral value fails decoding or encoding explicitly; it cannot
+  fall back to a rounded Double and acquire a different identity. Finite
+  fractional values retain floating-point representation. Current native macOS
+  and Windows targets use 64-bit Int.
 
 MCP declarations and client/server APIs remain upstream-owned. Vendor-specific
 Codex App Server and Exec behavior belongs to swift-codex; host authorization
@@ -44,8 +49,8 @@ limits. Tags are signed and immutable. Upstream tags retain their upstream
 identity; this fork does not move or replace them.
 
 Run `swift build` and `swift test` for the complete supported native package.
-Transport regression coverage lives in `Tests/MCPTests`, including real Windows
-pipe ownership and POSIX concurrent-write cases. The maintained transport CI
+Regression coverage lives in `Tests/MCPTests`, including request/response integer
+boundaries, real Windows pipe ownership and POSIX concurrent-write cases. The maintained transport CI
 runs the full macOS package and the native Windows consumer described in
 `Tests/WindowsIntegration/README.md`. Downstream native Windows jobs
 also exercise complete standard MCP connections and process cleanup with the
