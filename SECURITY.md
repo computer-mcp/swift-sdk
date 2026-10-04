@@ -1,12 +1,15 @@
 # Security Policy
 
-Thank you for helping keep the Model Context Protocol and its ecosystem secure.
+This repository is Computer MCP's compatibility fork of the MCP Swift SDK.
+[FORK.md](FORK.md) lists the behavior the fork owns.
 
 ## Reporting Security Issues
 
-If you discover a security vulnerability in this repository, please report it through
-the [GitHub Security Advisory process](https://docs.github.com/en/code-security/security-advisories/guidance-on-reporting-and-writing-information-about-vulnerabilities/privately-reporting-a-security-vulnerability)
-for this repository.
+- For a vulnerability in fork-owned behavior, or in how Computer MCP uses this
+  package, report it privately through
+  [Computer MCP's security advisories](https://github.com/computer-mcp/computer-mcp/security/advisories/new).
+- For a vulnerability in upstream SDK code, report it to
+  [modelcontextprotocol/swift-sdk](https://github.com/modelcontextprotocol/swift-sdk/security).
 
 Please **do not** report security vulnerabilities through public GitHub issues, discussions,
 or pull requests.
@@ -16,6 +19,7 @@ or pull requests.
 To help us triage and respond quickly, please include:
 
 - A description of the vulnerability
+- The affected release tag, such as `0.13.1-computer-mcp.1`
 - Steps to reproduce the issue
 - The potential impact
 - Any suggested fixes (optional)
