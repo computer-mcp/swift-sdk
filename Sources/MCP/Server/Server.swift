@@ -222,48 +222,53 @@ public actor Server {
                 for try await data in stream {
                     if Task.isCancelled { break }  // Check cancellation inside loop
 
-                    var requestID: ID?
                     do {
-                        // Attempt to decode as batch first, then as individual response, request, or notification
                         let decoder = JSONDecoder()
-                        if let batch = try? decoder.decode(Server.Batch.self, from: data) {
+                        if let batch = try? decoder.decode([IncomingMessage].self, from: data) {
                             try await handleBatch(batch)
-                        } else if let response = try? decoder.decode(AnyResponse.self, from: data) {
-                            await handleResponse(response)
-                        } else if let request = try? decoder.decode(AnyRequest.self, from: data) {
-                            // Handle request in a separate task to avoid blocking the receive loop
-                            Task {
-                                _ = try? await self.handleRequest(request, sendResponse: true)
-                            }
-                        } else if let message = try? decoder.decode(AnyMessage.self, from: data) {
-                            try await handleMessage(message)
                         } else {
-                            // Try to extract request ID from raw JSON if possible
-                            if let json = try? JSONDecoder().decode(
-                                [String: Value].self, from: data),
-                                let idValue = json["id"]
-                            {
-                                if let strValue = idValue.stringValue {
-                                    requestID = .string(strValue)
-                                } else if let intValue = idValue.intValue {
-                                    requestID = .number(intValue)
-                                }
+                            let message: IncomingMessage
+                            do {
+                                message = try decoder.decode(IncomingMessage.self, from: data)
+                            } catch {
+                                try await send(JSONRPCErrorResponse(
+                                    id: nil, error: .parseError("Invalid JSON")))
+                                continue
                             }
-                            throw MCPError.parseError("Invalid message format")
+                            switch message {
+                            case .request(let request):
+                                // Keep the receive loop available for cancellation and client responses.
+                                Task {
+                                    do {
+                                        _ = try await self.handleRequest(request, sendResponse: true)
+                                    } catch {
+                                        try? await self.send(JSONRPCErrorResponse(
+                                            id: request.id,
+                                            error: error as? MCPError
+                                                ?? .internalError(error.localizedDescription)))
+                                    }
+                                }
+                            case .response(let response):
+                                await handleResponse(response)
+                            case .notification(let notification):
+                                do {
+                                    try await handleMessage(notification)
+                                } catch {
+                                    await logger?.error(
+                                        "Error handling notification", metadata: ["error": "\(error)"])
+                                }
+                            case .error(let response):
+                                try await send(response)
+                            case .invalidNotification:
+                                await logger?.warning("Dropping invalid notification")
+                            }
                         }
                     } catch let error where MCPError.isResourceTemporarilyUnavailable(error) {
-                        // Resource temporarily unavailable, retry after a short delay
                         try? await Task.sleep(for: .milliseconds(10))
                         continue
                     } catch {
                         await logger?.error(
                             "Error processing message", metadata: ["error": "\(error)"])
-                        let response = AnyMethod.response(
-                            id: requestID ?? .random,
-                            error: error as? MCPError
-                                ?? MCPError.internalError(error.localizedDescription)
-                        )
-                        try? await send(response)
                     }
                 }
             } catch {
@@ -659,70 +664,73 @@ public actor Server {
         return result.roots
     }
 
-    /// A JSON-RPC batch containing multiple requests and/or notifications
-    struct Batch: Sendable {
-        /// An item in a JSON-RPC batch
-        enum Item: Sendable {
-            case request(Request<AnyMethod>)
-            case notification(Message<AnyNotification>)
+    private enum BatchResponse: Encodable {
+        case response(AnyResponse)
+        case error(JSONRPCErrorResponse)
 
-        }
-
-        var items: [Item]
-
-        init(items: [Item]) {
-            self.items = items
+        func encode(to encoder: Encoder) throws {
+            switch self {
+            case .response(let response): try response.encode(to: encoder)
+            case .error(let response): try response.encode(to: encoder)
+            }
         }
     }
 
-    /// Process a batch of requests and/or notifications
-    private func handleBatch(_ batch: Batch) async throws {
-        await logger?.trace("Processing batch request", metadata: ["size": "\(batch.items.count)"])
+    private func send(_ response: JSONRPCErrorResponse) async throws {
+        guard let connection else {
+            throw MCPError.internalError("Server connection not initialized")
+        }
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
+        try await connection.send(encoder.encode(response))
+    }
 
-        if batch.items.isEmpty {
-            // Empty batch is invalid according to JSON-RPC spec
-            let error = MCPError.invalidRequest("Batch array must not be empty")
-            let response = AnyMethod.response(id: .random, error: error)
-            try await send(response)
+    /// Process each batch element independently and reply only where required.
+    private func handleBatch(_ batch: [IncomingMessage]) async throws {
+        await logger?.trace("Processing batch request", metadata: ["size": "\(batch.count)"])
+
+        guard !batch.isEmpty else {
+            try await send(JSONRPCErrorResponse(
+                id: nil, error: .invalidRequest("Batch array must not be empty")))
             return
         }
 
-        // Process each item in the batch and collect responses
-        var responses: [Response<AnyMethod>] = []
-
-        for item in batch.items {
-            do {
-                switch item {
-                case .request(let request):
-                    // For batched requests, collect responses instead of sending immediately
+        var responses: [BatchResponse] = []
+        for item in batch {
+            switch item {
+            case .request(let request):
+                do {
                     if let response = try await handleRequest(request, sendResponse: false) {
-                        responses.append(response)
+                        responses.append(.response(response))
                     }
-
-                case .notification(let notification):
-                    // Handle notification (no response needed)
+                } catch {
+                    responses.append(.error(JSONRPCErrorResponse(
+                        id: request.id,
+                        error: error as? MCPError ?? .internalError(error.localizedDescription))))
+                }
+            case .response(let response):
+                await handleResponse(response)
+            case .notification(let notification):
+                do {
                     try await handleMessage(notification)
+                } catch {
+                    await logger?.error(
+                        "Error handling notification", metadata: ["error": "\(error)"])
                 }
-            } catch {
-                // Only add errors to response for requests (notifications don't have responses)
-                if case .request(let request) = item {
-                    let mcpError =
-                        error as? MCPError ?? MCPError.internalError(error.localizedDescription)
-                    responses.append(AnyMethod.response(id: request.id, error: mcpError))
-                }
+            case .error(let response):
+                responses.append(.error(response))
+            case .invalidNotification:
+                await logger?.warning("Dropping invalid notification")
             }
         }
 
-        // Send collected responses if any
         if !responses.isEmpty {
             let encoder = JSONEncoder()
             encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
             let responseData = try encoder.encode(responses)
-
-            guard let connection = connection else {
+            guard let connection else {
                 throw MCPError.internalError("Server connection not initialized")
             }
-
             try await connection.send(responseData)
         }
     }
@@ -738,15 +746,6 @@ public actor Server {
     private func handleRequest(_ request: Request<AnyMethod>, sendResponse: Bool = true)
         async throws -> Response<AnyMethod>?
     {
-        // Check if this is a pre-processed error request (empty method)
-        if request.method.isEmpty && !sendResponse {
-            // This is a placeholder for an invalid request that couldn't be parsed in batch mode
-            return AnyMethod.response(
-                id: request.id,
-                error: MCPError.invalidRequest("Invalid batch item format")
-            )
-        }
-
         await logger?.trace(
             "Processing request",
             metadata: [
@@ -1037,52 +1036,5 @@ public actor Server {
             .init(requestId: requestID, reason: reason)
         )
         try await notify(notification)
-    }
-}
-
-extension Server.Batch: Codable {
-    init(from decoder: Decoder) throws {
-        let container = try decoder.singleValueContainer()
-
-        let encoder = JSONEncoder()
-        let decoder = JSONDecoder()
-
-        var items: [Item] = []
-        for item in try container.decode([Value].self) {
-            let data = try encoder.encode(item)
-            try items.append(decoder.decode(Item.self, from: data))
-        }
-
-        self.items = items
-    }
-
-    func encode(to encoder: Encoder) throws {
-        var container = encoder.singleValueContainer()
-        try container.encode(items)
-    }
-}
-
-extension Server.Batch.Item: Codable {
-    private enum CodingKeys: String, CodingKey {
-        case id
-    }
-
-    init(from decoder: Decoder) throws {
-        let container = try decoder.container(keyedBy: CodingKeys.self)
-        // Check if it's a request (has id) or notification (no id)
-        if container.contains(.id) {
-            self = .request(try Request<AnyMethod>(from: decoder))
-        } else {
-            self = .notification(try Message<AnyNotification>(from: decoder))
-        }
-    }
-
-    func encode(to encoder: Encoder) throws {
-        switch self {
-        case .request(let request):
-            try request.encode(to: encoder)
-        case .notification(let notification):
-            try notification.encode(to: encoder)
-        }
     }
 }

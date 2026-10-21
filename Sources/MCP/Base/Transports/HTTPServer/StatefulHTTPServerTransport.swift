@@ -59,6 +59,12 @@ public actor StatefulHTTPServerTransport: Transport, HTTPContextProviding {
     /// the stream is closed, or the session terminates.
     private var httpRequestContexts: [String: HTTPRequest] = [:]
 
+    private struct PendingBatch {
+        let requestIDs: [String]
+        let hasNullError: Bool
+    }
+    private var pendingBatches: [PendingBatch] = []
+
     // MARK: - Standalone GET SSE stream
 
     /// The standalone SSE stream continuation for server-initiated messages.
@@ -141,6 +147,23 @@ public actor StatefulHTTPServerTransport: Transport, HTTPContextProviding {
             throw MCPError.connectionClosed
         }
 
+        if let responses = try? JSONDecoder().decode([JSONRPCEnvelope].self, from: data) {
+            let responseIDs = Set(responses.compactMap { $0.id?.description })
+            // A batch with only null-id errors has no readable response ID.
+            // The server awaits batch dispatch, so those replies preserve POST order.
+            guard let index = pendingBatches.firstIndex(where: { batch in
+                !responseIDs.isDisjoint(with: batch.requestIDs)
+                    || (responseIDs.isEmpty && batch.hasNullError)
+            }) else {
+                logger.warning("No POST waiting for batch response")
+                return
+            }
+            let batch = pendingBatches.remove(at: index)
+            routeResponse(data, requestID: batch.requestIDs[0])
+            for id in batch.requestIDs { httpRequestContexts.removeValue(forKey: id) }
+            return
+        }
+
         guard let kind = JSONRPCMessageKind(data: data) else {
             logger.warning("Could not classify outgoing message for routing")
             return
@@ -205,19 +228,33 @@ public actor StatefulHTTPServerTransport: Transport, HTTPContextProviding {
             )
         }
 
-        guard let messageKind = JSONRPCMessageKind(data: body) else {
+        let decoder = JSONDecoder()
+        let messages: [IncomingMessage]
+        let isBatch: Bool
+        do {
+            if let batch = try? decoder.decode([IncomingMessage].self, from: body) {
+                messages = batch
+                isBatch = true
+            } else {
+                messages = [try decoder.decode(IncomingMessage.self, from: body)]
+                isBatch = false
+            }
+        } catch {
             return .error(
                 statusCode: 400,
-                .parseError("Invalid JSON-RPC message"),
+                .parseError("Invalid JSON"),
                 sessionID: sessionID
             )
         }
+        let envelope = try? decoder.decode(JSONRPCEnvelope.self, from: body)
+        let isInitializationRequest = !isBatch && envelope?.jsonrpc == "2.0"
+            && envelope?.id != nil && envelope?.method == "initialize"
 
         // Build validation context
         let context = HTTPValidationContext(
             httpMethod: "POST",
             sessionID: sessionID,
-            isInitializationRequest: messageKind.isInitializeRequest,
+            isInitializationRequest: isInitializationRequest,
             supportedProtocolVersions: Version.supported
         )
 
@@ -226,20 +263,78 @@ public actor StatefulHTTPServerTransport: Transport, HTTPContextProviding {
             return errorResponse
         }
 
-        // Handle initialization request specially
-        if messageKind.isInitializeRequest {
+        if isBatch {
+            return handleBatchPost(messages, body: body, request: request)
+        }
+
+        if isInitializationRequest {
             return handleInitializationRequest(body, request: request)
         }
 
-        // Handle by message type
-        switch messageKind {
-        case .notification, .response:
-            // Yield to server and return 202 Accepted
+        switch messages[0] {
+        case .notification, .response, .invalidNotification:
             incomingContinuation.yield(body)
             return .accepted(headers: sessionHeaders())
+        case .request(let message):
+            return handleJSONRPCRequest(body, requestID: message.id.description, request: request)
+        case .error(let response):
+            if let id = response.id {
+                return handleJSONRPCRequest(body, requestID: id.description, request: request)
+            }
+            // Undeterminable IDs cannot select an SSE stream. Reply on the carrying POST.
+            return .error(statusCode: 400, response.error, sessionID: sessionID)
+        }
+    }
 
-        case .request(let id, _):
-            return handleJSONRPCRequest(body, requestID: id, request: request)
+    private func handleBatchPost(
+        _ messages: [IncomingMessage], body: Data, request: HTTPRequest
+    ) -> HTTPResponse {
+        guard !messages.isEmpty else {
+            return .error(
+                statusCode: 400, .invalidRequest("Batch array must not be empty"), sessionID: sessionID)
+        }
+        let requestIDs = messages.compactMap { message -> String? in
+            switch message {
+            case .request(let request): return request.id.description
+            case .error(let response): return response.id?.description
+            default: return nil
+            }
+        }
+        if let streamID = requestIDs.first {
+            let hasNullError = messages.contains { message in
+                if case .error(let response) = message { return response.id == nil }
+                return false
+            }
+            pendingBatches.append(PendingBatch(requestIDs: requestIDs, hasNullError: hasNullError))
+            for id in requestIDs { httpRequestContexts[id] = request }
+            return handleJSONRPCRequest(body, requestID: streamID, request: request)
+        }
+
+        // No request can be correlated. Errors answer this POST; notifications
+        // and client responses still reach the server without opening a stream.
+        var errors: [JSONRPCErrorResponse] = []
+        let encoder = JSONEncoder()
+        do {
+            for message in messages {
+                switch message {
+                case .notification(let notification):
+                    incomingContinuation.yield(try encoder.encode(notification))
+                case .response(let response):
+                    incomingContinuation.yield(try encoder.encode(response))
+                case .error(let response):
+                    errors.append(response)
+                case .invalidNotification:
+                    logger.warning("Dropping invalid notification")
+                case .request:
+                    break
+                }
+            }
+            if errors.isEmpty { return .accepted(headers: sessionHeaders()) }
+            var headers = sessionHeaders()
+            headers[HTTPHeaderName.contentType] = ContentType.json
+            return .data(try encoder.encode(errors), headers: headers)
+        } catch {
+            return .error(statusCode: 500, .internalError("Could not encode batch"), sessionID: sessionID)
         }
     }
 
@@ -567,6 +662,7 @@ public actor StatefulHTTPServerTransport: Transport, HTTPContextProviding {
         }
         requestSSEContinuations.removeAll()
         httpRequestContexts.removeAll()
+        pendingBatches.removeAll()
 
         // Close standalone GET stream
         standaloneSSEContinuation?.finish()
