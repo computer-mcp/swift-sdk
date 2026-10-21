@@ -52,18 +52,12 @@ public actor StatefulHTTPServerTransport: Transport, HTTPContextProviding {
     // MARK: - SSE streams for POST request responses
 
     /// Maps request ID → SSE stream continuation for active POST request streams.
-    private var requestSSEContinuations: [String: AsyncThrowingStream<Data, Swift.Error>.Continuation] = [:]
+    private var requestSSEContinuations: [ID: AsyncThrowingStream<Data, Swift.Error>.Continuation] = [:]
 
     /// Maps request ID → originating HTTP request, surfaced to handlers via
     /// ``Server/currentHTTPContext``. Cleared when the response is routed,
     /// the stream is closed, or the session terminates.
-    private var httpRequestContexts: [String: HTTPRequest] = [:]
-
-    private struct PendingBatch {
-        let requestIDs: [String]
-        let hasNullError: Bool
-    }
-    private var pendingBatches: [PendingBatch] = []
+    private var httpRequestContexts: [ID: HTTPRequest] = [:]
 
     // MARK: - Standalone GET SSE stream
 
@@ -71,13 +65,15 @@ public actor StatefulHTTPServerTransport: Transport, HTTPContextProviding {
     /// Only one GET stream is allowed per session.
     private var standaloneSSEContinuation: AsyncThrowingStream<Data, Swift.Error>.Continuation?
 
-    /// Internal identifier for the standalone GET stream in the event store.
-    private let standaloneStreamID = "_GET_stream"
-
     // MARK: - Event Store (Resumability)
 
+    private enum StreamID: Equatable {
+        case request(ID)
+        case standalone
+    }
+
     private struct StoredEvent {
-        let streamID: String
+        let streamID: StreamID
         let eventID: String
         let message: Data?
     }
@@ -147,23 +143,6 @@ public actor StatefulHTTPServerTransport: Transport, HTTPContextProviding {
             throw MCPError.connectionClosed
         }
 
-        if let responses = try? JSONDecoder().decode([JSONRPCEnvelope].self, from: data) {
-            let responseIDs = Set(responses.compactMap { $0.id?.description })
-            // A batch with only null-id errors has no readable response ID.
-            // The server awaits batch dispatch, so those replies preserve POST order.
-            guard let index = pendingBatches.firstIndex(where: { batch in
-                !responseIDs.isDisjoint(with: batch.requestIDs)
-                    || (responseIDs.isEmpty && batch.hasNullError)
-            }) else {
-                logger.warning("No POST waiting for batch response")
-                return
-            }
-            let batch = pendingBatches.remove(at: index)
-            routeResponse(data, requestID: batch.requestIDs[0])
-            for id in batch.requestIDs { httpRequestContexts.removeValue(forKey: id) }
-            return
-        }
-
         guard let kind = JSONRPCMessageKind(data: data) else {
             logger.warning("Could not classify outgoing message for routing")
             return
@@ -229,16 +208,9 @@ public actor StatefulHTTPServerTransport: Transport, HTTPContextProviding {
         }
 
         let decoder = JSONDecoder()
-        let messages: [IncomingMessage]
-        let isBatch: Bool
+        let message: IncomingMessage
         do {
-            if let batch = try? decoder.decode([IncomingMessage].self, from: body) {
-                messages = batch
-                isBatch = true
-            } else {
-                messages = [try decoder.decode(IncomingMessage.self, from: body)]
-                isBatch = false
-            }
+            message = try decoder.decode(IncomingMessage.self, from: body)
         } catch {
             return .error(
                 statusCode: 400,
@@ -247,8 +219,7 @@ public actor StatefulHTTPServerTransport: Transport, HTTPContextProviding {
             )
         }
         let envelope = try? decoder.decode(JSONRPCEnvelope.self, from: body)
-        let isInitializationRequest = !isBatch && envelope?.jsonrpc == "2.0"
-            && envelope?.id != nil && envelope?.method == "initialize"
+        let isInitializationRequest = envelope?.isInitializeRequest == true
 
         // Build validation context
         let context = HTTPValidationContext(
@@ -263,82 +234,42 @@ public actor StatefulHTTPServerTransport: Transport, HTTPContextProviding {
             return errorResponse
         }
 
-        if isBatch {
-            return handleBatchPost(messages, body: body, request: request)
+        if isInitializationRequest, let requestID = envelope?.id {
+            // Both the type-erased values and typed params must decode before
+            // assigning a session or retaining it in the HTTP host.
+            guard case .request = message,
+                (try? decoder.decode(Request<Initialize>.self, from: body)) != nil
+            else {
+                let response = JSONRPCErrorResponse(
+                    id: requestID, error: .invalidParams("Invalid params field"))
+                guard let data = try? JSONEncoder().encode(response) else {
+                    return .error(statusCode: 500, .internalError("Could not encode initialize error"))
+                }
+                var headers = sessionHeaders()
+                headers[HTTPHeaderName.contentType] = ContentType.json
+                return .data(data, headers: headers)
+            }
+            return handleInitializationRequest(body, requestID: requestID, request: request)
         }
 
-        if isInitializationRequest {
-            return handleInitializationRequest(body, request: request)
-        }
-
-        switch messages[0] {
+        switch message {
         case .notification, .response, .invalidNotification:
             incomingContinuation.yield(body)
             return .accepted(headers: sessionHeaders())
         case .request(let message):
-            return handleJSONRPCRequest(body, requestID: message.id.description, request: request)
+            return handleJSONRPCRequest(body, requestID: message.id, request: request)
         case .error(let response):
             if let id = response.id {
-                return handleJSONRPCRequest(body, requestID: id.description, request: request)
+                return handleJSONRPCRequest(body, requestID: id, request: request)
             }
             // Undeterminable IDs cannot select an SSE stream. Reply on the carrying POST.
             return .error(statusCode: 400, response.error, sessionID: sessionID)
         }
     }
 
-    private func handleBatchPost(
-        _ messages: [IncomingMessage], body: Data, request: HTTPRequest
+    private func handleInitializationRequest(
+        _ body: Data, requestID: ID, request: HTTPRequest
     ) -> HTTPResponse {
-        guard !messages.isEmpty else {
-            return .error(
-                statusCode: 400, .invalidRequest("Batch array must not be empty"), sessionID: sessionID)
-        }
-        let requestIDs = messages.compactMap { message -> String? in
-            switch message {
-            case .request(let request): return request.id.description
-            case .error(let response): return response.id?.description
-            default: return nil
-            }
-        }
-        if let streamID = requestIDs.first {
-            let hasNullError = messages.contains { message in
-                if case .error(let response) = message { return response.id == nil }
-                return false
-            }
-            pendingBatches.append(PendingBatch(requestIDs: requestIDs, hasNullError: hasNullError))
-            for id in requestIDs { httpRequestContexts[id] = request }
-            return handleJSONRPCRequest(body, requestID: streamID, request: request)
-        }
-
-        // No request can be correlated. Errors answer this POST; notifications
-        // and client responses still reach the server without opening a stream.
-        var errors: [JSONRPCErrorResponse] = []
-        let encoder = JSONEncoder()
-        do {
-            for message in messages {
-                switch message {
-                case .notification(let notification):
-                    incomingContinuation.yield(try encoder.encode(notification))
-                case .response(let response):
-                    incomingContinuation.yield(try encoder.encode(response))
-                case .error(let response):
-                    errors.append(response)
-                case .invalidNotification:
-                    logger.warning("Dropping invalid notification")
-                case .request:
-                    break
-                }
-            }
-            if errors.isEmpty { return .accepted(headers: sessionHeaders()) }
-            var headers = sessionHeaders()
-            headers[HTTPHeaderName.contentType] = ContentType.json
-            return .data(try encoder.encode(errors), headers: headers)
-        } catch {
-            return .error(statusCode: 500, .internalError("Could not encode batch"), sessionID: sessionID)
-        }
-    }
-
-    private func handleInitializationRequest(_ body: Data, request: HTTPRequest) -> HTTPResponse {
         // Reject re-initialization at the transport level
         if sessionID != nil {
             return .error(
@@ -363,20 +294,11 @@ public actor StatefulHTTPServerTransport: Transport, HTTPContextProviding {
         self.sessionID = newSessionID
         logger.info("Session initialized", metadata: ["sessionID": "\(newSessionID)"])
 
-        // Extract request ID for routing the response
-        guard case .request(let requestID, _) = JSONRPCMessageKind(data: body) else {
-            return .error(
-                statusCode: 400,
-                .parseError("Invalid initialize request"),
-                sessionID: newSessionID
-            )
-        }
-
         // For the initialize request, use SSE streaming like any other request
         return handleJSONRPCRequest(body, requestID: requestID, request: request)
     }
 
-    private func handleJSONRPCRequest(_ body: Data, requestID: String, request: HTTPRequest) -> HTTPResponse {
+    private func handleJSONRPCRequest(_ body: Data, requestID: ID, request: HTTPRequest) -> HTTPResponse {
         // Create SSE stream for this request
         let (sseStream, sseContinuation) = AsyncThrowingStream<Data, Swift.Error>.makeStream()
         requestSSEContinuations[requestID] = sseContinuation
@@ -387,7 +309,7 @@ public actor StatefulHTTPServerTransport: Transport, HTTPContextProviding {
 
         // Send priming event for resumability
         sendPrimingEvent(
-            streamID: requestID,
+            streamID: .request(requestID),
             continuation: sseContinuation,
             protocolVersion: protocolVersion
         )
@@ -443,7 +365,7 @@ public actor StatefulHTTPServerTransport: Transport, HTTPContextProviding {
 
         // Send priming event
         sendPrimingEvent(
-            streamID: standaloneStreamID,
+            streamID: .standalone,
             continuation: sseContinuation,
             protocolVersion: protocolVersion
         )
@@ -481,8 +403,8 @@ public actor StatefulHTTPServerTransport: Transport, HTTPContextProviding {
 
     /// Routes a message to a specific request's SSE stream without closing it.
     /// Used for server-initiated messages during request handling.
-    private func routeToRequestStream(_ data: Data, requestID: String) {
-        let eventID = storeEvent(streamID: requestID, message: data)
+    private func routeToRequestStream(_ data: Data, requestID: ID) {
+        let eventID = storeEvent(streamID: .request(requestID), message: data)
 
         guard let continuation = requestSSEContinuations[requestID] else {
             logger.debug(
@@ -499,7 +421,7 @@ public actor StatefulHTTPServerTransport: Transport, HTTPContextProviding {
 
     /// Routes a response to a specific request's SSE stream and closes it.
     /// Used for final responses to client requests.
-    private func routeResponse(_ data: Data, requestID: String) {
+    private func routeResponse(_ data: Data, requestID: ID) {
         routeToRequestStream(data, requestID: requestID)
 
         // Response means the request is complete — close the stream
@@ -511,7 +433,7 @@ public actor StatefulHTTPServerTransport: Transport, HTTPContextProviding {
     }
 
     private func routeServerInitiatedMessage(_ data: Data) {
-        let eventID = storeEvent(streamID: standaloneStreamID, message: data)
+        let eventID = storeEvent(streamID: .standalone, message: data)
 
         guard let continuation = standaloneSSEContinuation else {
             logger.debug("No standalone GET stream connected, message stored for replay")
@@ -542,10 +464,11 @@ public actor StatefulHTTPServerTransport: Transport, HTTPContextProviding {
         }
 
         // Re-register the stream for future messages
-        if replay.streamID == standaloneStreamID {
+        switch replay.streamID {
+        case .standalone:
             standaloneSSEContinuation = sseContinuation
-        } else {
-            requestSSEContinuations[replay.streamID] = sseContinuation
+        case .request(let id):
+            requestSSEContinuations[id] = sseContinuation
         }
 
         // Send a new priming event so the client can resume again if disconnected
@@ -566,14 +489,18 @@ public actor StatefulHTTPServerTransport: Transport, HTTPContextProviding {
 
     // MARK: - Internal Event Store
 
-    private func storeEvent(streamID: String, message: Data?) -> String {
+    private func storeEvent(streamID: StreamID, message: Data?) -> String {
         eventCounter += 1
-        let eventID = "\(streamID)_\(eventCounter)"
+        let streamName = switch streamID {
+        case .request(let id): id.description
+        case .standalone: "_GET_stream"
+        }
+        let eventID = "\(streamName)_\(eventCounter)"
         storedEvents.append(StoredEvent(streamID: streamID, eventID: eventID, message: message))
         return eventID
     }
 
-    private func replayEventsAfter(_ lastEventID: String) -> (streamID: String, events: [(eventID: String, message: Data)])? {
+    private func replayEventsAfter(_ lastEventID: String) -> (streamID: StreamID, events: [(eventID: String, message: Data)])? {
         guard let index = storedEvents.firstIndex(where: { $0.eventID == lastEventID }) else {
             return nil
         }
@@ -587,7 +514,7 @@ public actor StatefulHTTPServerTransport: Transport, HTTPContextProviding {
     // MARK: - SSE Helpers
 
     private func sendPrimingEvent(
-        streamID: String,
+        streamID: StreamID,
         continuation: AsyncThrowingStream<Data, Swift.Error>.Continuation,
         protocolVersion: String
     ) {
@@ -633,7 +560,7 @@ public actor StatefulHTTPServerTransport: Transport, HTTPContextProviding {
     ///
     /// Used to trigger client reconnection mid-call (SEP-1699). The response,
     /// when eventually sent, will be stored and replayed to the reconnected stream.
-    package func closeSSEStream(forRequestID requestID: String) {
+    package func closeSSEStream(forRequestID requestID: ID) {
         guard let continuation = requestSSEContinuations[requestID] else { return }
         continuation.finish()
         requestSSEContinuations.removeValue(forKey: requestID)
@@ -643,7 +570,7 @@ public actor StatefulHTTPServerTransport: Transport, HTTPContextProviding {
     // MARK: - HTTPContextProviding
 
     public func httpRequestContext(for id: ID) -> HTTPRequest? {
-        httpRequestContexts[id.description]
+        httpRequestContexts[id]
     }
 
     // MARK: - Termination
@@ -662,7 +589,6 @@ public actor StatefulHTTPServerTransport: Transport, HTTPContextProviding {
         }
         requestSSEContinuations.removeAll()
         httpRequestContexts.removeAll()
-        pendingBatches.removeAll()
 
         // Close standalone GET stream
         standaloneSSEContinuation?.finish()

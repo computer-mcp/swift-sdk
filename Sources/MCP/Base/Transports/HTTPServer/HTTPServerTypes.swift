@@ -233,27 +233,28 @@ public protocol HTTPContextProviding: Sendable {
 /// - Responses are routed to the originating request's stream
 /// - Notifications and server requests are routed to the standalone GET stream
 package enum JSONRPCMessageKind {
-    case request(id: String, method: String)
+    case request(id: ID, method: String)
     case notification(method: String)
-    case response(id: String)
+    case response(id: ID)
 
     /// Attempts to classify raw JSON-RPC data.
     /// Returns `nil` if the data cannot be parsed or classified.
     package init?(data: Data) {
-        guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+        guard let envelope = try? JSONDecoder().decode(JSONRPCEnvelope.self, from: data),
+            envelope.jsonrpc == "2.0"
+        else {
             return nil
         }
 
-        let id = Self.extractID(from: json)
-
-        if let method = json["method"] as? String {
-            if let id {
+        if let method = envelope.method {
+            if let id = envelope.id {
                 self = .request(id: id, method: method)
-            } else {
+            } else if envelope.isNotification {
                 self = .notification(method: method)
+            } else {
+                return nil
             }
-        } else if json["result"] != nil || json["error"] != nil {
-            guard let id else { return nil }
+        } else if envelope.hasResultOrError, let id = envelope.id {
             self = .response(id: id)
         } else {
             return nil
@@ -272,14 +273,5 @@ package enum JSONRPCMessageKind {
             return method == "initialize"
         }
         return false
-    }
-
-    private static func extractID(from json: [String: Any]) -> String? {
-        if let stringID = json["id"] as? String {
-            return stringID
-        } else if let intID = json["id"] as? Int {
-            return String(intID)
-        }
-        return nil
     }
 }

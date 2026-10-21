@@ -4,9 +4,10 @@ struct JSONRPCEnvelope: Decodable {
     let id: ID?
     let method: String?
     let hasID: Bool
+    let hasResultOrError: Bool
 
     private enum CodingKeys: String, CodingKey {
-        case jsonrpc, id, method
+        case jsonrpc, id, method, result, error
     }
 
     init(from decoder: Decoder) throws {
@@ -14,6 +15,7 @@ struct JSONRPCEnvelope: Decodable {
         jsonrpc = try? container?.decode(String.self, forKey: .jsonrpc)
         method = try? container?.decode(String.self, forKey: .method)
         hasID = container?.contains(.id) ?? false
+        hasResultOrError = container?.contains(.result) == true || container?.contains(.error) == true
         // ID's public decoder maps null to an empty string. An error envelope
         // instead treats null and unsupported IDs as undeterminable.
         if (try? container?.decodeNil(forKey: .id)) == false {
@@ -24,6 +26,10 @@ struct JSONRPCEnvelope: Decodable {
     }
 
     var isNotification: Bool { !hasID && method != nil }
+
+    var isInitializeRequest: Bool {
+        jsonrpc == "2.0" && id != nil && method == Initialize.name
+    }
 
     var decodingError: JSONRPCErrorResponse {
         let error: MCPError =

@@ -50,12 +50,12 @@ public actor StatelessHTTPServerTransport: Transport, HTTPContextProviding {
 
     /// Maps request ID → continuation waiting for the server's response.
     /// When the server calls `send()` with a response, the matching continuation is resumed.
-    private var responseWaiters: [String: CheckedContinuation<Data, any Error>] = [:]
+    private var responseWaiters: [ID: CheckedContinuation<Data, any Error>] = [:]
 
     /// Maps request ID → originating HTTP request, surfaced to handlers via
     /// ``Server/currentHTTPContext``. Entries live only while a JSON-RPC request
     /// is in flight.
-    private var httpRequestContexts: [String: HTTPRequest] = [:]
+    private var httpRequestContexts: [ID: HTTPRequest] = [:]
 
     // MARK: - Init
 
@@ -184,18 +184,23 @@ public actor StatelessHTTPServerTransport: Transport, HTTPContextProviding {
             )
         }
 
-        guard let messageKind = JSONRPCMessageKind(data: body) else {
+        let decoder = JSONDecoder()
+        let message: IncomingMessage
+        do {
+            message = try decoder.decode(IncomingMessage.self, from: body)
+        } catch {
             return .error(
                 statusCode: 400,
-                .parseError("Invalid JSON-RPC message")
+                .parseError("Invalid JSON")
             )
         }
+        let envelope = try? decoder.decode(JSONRPCEnvelope.self, from: body)
 
         // Build validation context
         let context = HTTPValidationContext(
             httpMethod: "POST",
             sessionID: nil,
-            isInitializationRequest: messageKind.isInitializeRequest,
+            isInitializationRequest: envelope?.isInitializeRequest == true,
             supportedProtocolVersions: Version.supported
         )
 
@@ -205,31 +210,34 @@ public actor StatelessHTTPServerTransport: Transport, HTTPContextProviding {
         }
 
         // Handle by message type
-        switch messageKind {
-        case .notification, .response:
+        switch message {
+        case .notification, .response, .invalidNotification:
             // Yield to server and return 202 Accepted
             incomingContinuation.yield(body)
             return .accepted()
 
-        case .request(let id, _):
-            return await handleJSONRPCRequest(body, requestID: id, request: request)
+        case .request(let message):
+            return await handleJSONRPCRequest(body, requestID: message.id, request: request)
+        case .error(let response):
+            if let id = response.id {
+                return await handleJSONRPCRequest(body, requestID: id, request: request)
+            }
+            return .error(statusCode: 400, response.error)
         }
     }
 
     private func handleJSONRPCRequest(
         _ body: Data,
-        requestID: String,
+        requestID: ID,
         request: HTTPRequest
     ) async -> HTTPResponse {
         httpRequestContexts[requestID] = request
-        // Yield the incoming message to the server
-        incomingContinuation.yield(body)
-
         // Wait for the server to process and send a response
         let responseData: Data
         do {
             responseData = try await withCheckedThrowingContinuation { continuation in
                 responseWaiters[requestID] = continuation
+                incomingContinuation.yield(body)
             }
         } catch {
             httpRequestContexts.removeValue(forKey: requestID)
@@ -246,7 +254,7 @@ public actor StatelessHTTPServerTransport: Transport, HTTPContextProviding {
     // MARK: - HTTPContextProviding
 
     public func httpRequestContext(for id: ID) -> HTTPRequest? {
-        httpRequestContexts[id.description]
+        httpRequestContexts[id]
     }
 
     // MARK: - Termination

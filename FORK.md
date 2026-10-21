@@ -24,10 +24,14 @@ The fork owns the following transport and JSON interoperability behavior:
   fractional values retain floating-point representation. Current native macOS
   and Windows targets use 64-bit Int.
 - Request decoding recovers the JSON-RPC envelope independently of parameter
-  values. Invalid params retain the request ID; parse errors and invalid requests
-  with undeterminable IDs use null. Notifications receive no reply, batch elements
-  are processed independently, and stateful HTTP errors complete the carrying
-  POST or request stream. This compatible fix targets `0.13.2-computer-mcp.1`.
+  values. Invalid params retain the request ID; invalid requests retain a readable
+  ID, otherwise use null, and parse errors use null. Notifications receive no
+  reply. Stdio batch elements are processed independently; HTTP transports do not
+  accept batches and reject array POSTs with Invalid Request and a null ID.
+  Stateful and stateless HTTP errors complete the carrying POST or request stream,
+  and routing preserves numeric and string ID types. Initialization params must
+  decode before session or server initialization state is committed. This
+  compatible fix targets `0.13.2-computer-mcp.1`.
 
 MCP declarations and client/server APIs remain upstream-owned. Vendor-specific
 Codex App Server and Exec behavior belongs to swift-codex; host authorization

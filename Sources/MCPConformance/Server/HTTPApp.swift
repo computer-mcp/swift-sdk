@@ -212,20 +212,19 @@ actor HTTPApp {
             let server = try await serverFactory(sessionID, transport)
             try await server.start(transport: transport)
 
+            let response = await transport.handleRequest(request)
+
+            guard response.headers[HTTPHeaderName.sessionID] == sessionID else {
+                await server.stop()
+                return response
+            }
+
             sessions[sessionID] = SessionContext(
                 server: server,
                 transport: transport,
                 createdAt: Date(),
                 lastAccessedAt: Date()
             )
-
-            let response = await transport.handleRequest(request)
-
-            // If transport returned an error, clean up
-            if case .error = response {
-                sessions.removeValue(forKey: sessionID)
-                await transport.disconnect()
-            }
 
             return response
         } catch {
