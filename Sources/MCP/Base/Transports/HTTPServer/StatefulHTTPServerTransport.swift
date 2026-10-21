@@ -253,7 +253,7 @@ public actor StatefulHTTPServerTransport: Transport, HTTPContextProviding {
         }
 
         switch message {
-        case .notification, .response, .invalidNotification:
+        case .notification, .response, .invalidResponse, .invalidNotification:
             incomingContinuation.yield(body)
             return .accepted(headers: sessionHeaders())
         case .request(let message):

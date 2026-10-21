@@ -211,7 +211,7 @@ public actor StatelessHTTPServerTransport: Transport, HTTPContextProviding {
 
         // Handle by message type
         switch message {
-        case .notification, .response, .invalidNotification:
+        case .notification, .response, .invalidResponse, .invalidNotification:
             // Yield to server and return 202 Accepted
             incomingContinuation.yield(body)
             return .accepted()

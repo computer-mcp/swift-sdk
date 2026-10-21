@@ -250,6 +250,8 @@ public actor Server {
                                 }
                             case .response(let response):
                                 await handleResponse(response)
+                            case .invalidResponse(let id, let error):
+                                await handleResponseDecodingError(id: id, error: error)
                             case .notification(let notification):
                                 do {
                                     try await handleMessage(notification)
@@ -710,6 +712,8 @@ public actor Server {
                 }
             case .response(let response):
                 await handleResponse(response)
+            case .invalidResponse(let id, let error):
+                await handleResponseDecodingError(id: id, error: error)
             case .notification(let notification):
                 do {
                     try await handleMessage(notification)
@@ -888,6 +892,15 @@ public actor Server {
                 "Received response for unknown request",
                 metadata: ["id": "\(response.id)"]
             )
+        }
+    }
+
+    private func handleResponseDecodingError(id: ID?, error: Swift.Error) async {
+        await logger?.error(
+            "Error decoding response",
+            metadata: ["id": "\(id?.description ?? "null")", "error": "\(error)"])
+        if let id, let pendingRequest = removePendingResponse(id: id) {
+            pendingRequest.resume(throwing: error)
         }
     }
 

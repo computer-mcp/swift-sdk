@@ -1,9 +1,10 @@
-/// The fields needed to recover correlation independently of parameter values.
+/// The fields needed to recover message identity independently of payload values.
 struct JSONRPCEnvelope: Decodable {
     let jsonrpc: String?
     let id: ID?
     let method: String?
     let hasID: Bool
+    let hasMethod: Bool
     let hasResultOrError: Bool
 
     private enum CodingKeys: String, CodingKey {
@@ -15,8 +16,9 @@ struct JSONRPCEnvelope: Decodable {
         jsonrpc = try? container?.decode(String.self, forKey: .jsonrpc)
         method = try? container?.decode(String.self, forKey: .method)
         hasID = container?.contains(.id) ?? false
+        hasMethod = container?.contains(.method) ?? false
         hasResultOrError = container?.contains(.result) == true || container?.contains(.error) == true
-        // ID's public decoder maps null to an empty string. An error envelope
+        // ID's public decoder maps null to an empty string. Envelope recovery
         // instead treats null and unsupported IDs as undeterminable.
         if (try? container?.decodeNil(forKey: .id)) == false {
             id = try? container?.decode(ID.self, forKey: .id)
@@ -26,6 +28,8 @@ struct JSONRPCEnvelope: Decodable {
     }
 
     var isNotification: Bool { !hasID && method != nil }
+
+    var isResponse: Bool { hasID && hasResultOrError && !hasMethod }
 
     var isInitializeRequest: Bool {
         jsonrpc == "2.0" && id != nil && method == Initialize.name
@@ -44,6 +48,7 @@ struct JSONRPCEnvelope: Decodable {
 enum IncomingMessage: Decodable, Sendable {
     case request(AnyRequest)
     case response(AnyResponse)
+    case invalidResponse(id: ID?, error: Swift.Error)
     case notification(AnyMessage)
     case error(JSONRPCErrorResponse)
     case invalidNotification
@@ -56,8 +61,12 @@ enum IncomingMessage: Decodable, Sendable {
             } else {
                 self = .invalidNotification
             }
-        } else if envelope.id != nil, let response = try? AnyResponse(from: decoder) {
-            self = .response(response)
+        } else if envelope.isResponse {
+            do {
+                self = .response(try AnyResponse(from: decoder))
+            } catch {
+                self = .invalidResponse(id: envelope.id, error: error)
+            }
         } else if envelope.id != nil, let request = try? AnyRequest(from: decoder) {
             self = .request(request)
         } else {

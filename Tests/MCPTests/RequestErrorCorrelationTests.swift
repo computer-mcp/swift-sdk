@@ -54,6 +54,12 @@ private let errorCases: [ErrorCase] = [
 private let invalidNotification =
     #"{"jsonrpc":"2.0","method":"notifications/initialized","params":{"_meta":{"sequence":9223372036854775808}}}"#
 
+private let invalidResponseMembers = [
+    #""result":{"n":9223372036854775808}"#,
+    #""error":{"code":-32603,"message":"failed","data":{"n":-9223372036854775809}}"#,
+    #""error":17"#,
+]
+
 private let mixedBatch = """
     [{"jsonrpc":"2.0","id":"good","method":"ping"},
      {"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"x","arguments":{"n":9223372036854775808}}},
@@ -109,6 +115,125 @@ struct RequestErrorCorrelationTests {
     func stdioNotificationBatch() async throws {
         let frames = try await stdioExchange("[\(invalidNotification)]", responseCount: 0)
         #expect(frames.isEmpty)
+    }
+
+    @Test("Stdio does not reply to undecodable responses", arguments: [false, true], invalidResponseMembers)
+    func stdioInvalidResponse(batch: Bool, member: String) async throws {
+        let raw = String(decoding: try invalidResponse(id: "r", member: member), as: UTF8.self)
+        let frames = try await stdioExchange(batch ? "[\(raw)]" : raw, responseCount: 0)
+        #expect(frames.isEmpty)
+    }
+
+    @Test("Stdio response decoding errors fail pending server requests", arguments: [false, true], invalidResponseMembers)
+    func stdioInvalidResponseFailsPendingRequest(batch: Bool, member: String) async throws {
+        try await withStdioServer { server, client in
+            let pending = Task { try await server.listRoots() }
+            let request = try await withinDeadline(onTimeout: { await server.stop() }) {
+                var iterator = await client.receive().makeAsyncIterator()
+                return try JSONDecoder().decode(AnyRequest.self, from: #require(try await iterator.next()))
+            }
+            #expect(request.method == ListRoots.name)
+            let raw = String(decoding: try invalidResponse(id: request.id, member: member), as: UTF8.self)
+            try await client.send(Data((batch ? "[\(raw)]" : raw).utf8))
+
+            await #expect(throws: DecodingError.self) {
+                try await withinDeadline(onTimeout: { await server.stop() }) {
+                    try await pending.value
+                }
+            }
+
+            try await client.send(Data(#"{"jsonrpc":"2.0","id":"barrier","method":"ping"}"#.utf8))
+            let reply = try await withinDeadline {
+                var iterator = await client.receive().makeAsyncIterator()
+                return try JSONDecoder().decode(WireResponse.self, from: #require(try await iterator.next()))
+            }
+            #expect(reply.id == .string("barrier"))
+            #expect(reply.result == .object([:]))
+            #expect(reply.error == nil)
+        }
+    }
+
+    @Test("HTTP undecodable responses are acknowledged without consuming a same-ID request",
+        arguments: [false, true], invalidResponseMembers)
+    func httpInvalidResponse(stateful: Bool, member: String) async throws {
+        let transport: any Transport & HTTPContextProviding
+        let post: @Sendable (HTTPRequest) async -> HTTPResponse
+        if stateful {
+            let stateful = StatefulHTTPServerTransport(
+                validationPipeline: StandardValidationPipeline(validators: []))
+            transport = stateful
+            post = { await stateful.handleRequest($0) }
+        } else {
+            let stateless = StatelessHTTPServerTransport()
+            transport = stateless
+            post = { await stateless.handleRequest($0) }
+        }
+        let server = Server(name: "correlation-test", version: "1")
+        let (entered, enteredContinuation) = AsyncStream<Void>.makeStream()
+        let (release, releaseContinuation) = AsyncStream<Void>.makeStream()
+        defer {
+            enteredContinuation.finish()
+            releaseContinuation.finish()
+        }
+        await server.withMethodHandler(CallTool.self) { _ in
+            enteredContinuation.yield(())
+            for await _ in release { break }
+            return .init(content: [.text(text: "ok", annotations: nil, _meta: nil)])
+        }
+        let request = HTTPRequest(
+            method: "POST", headers: httpHeaders,
+            body: try JSONEncoder().encode(CallTool.request(id: "r", .init(name: "x"))),
+            path: "/original")
+        try await server.start(transport: transport)
+        let (requests, requestContinuation) = AsyncStream<HTTPResponse>.makeStream()
+        let requestTask = Task {
+            requestContinuation.yield(await post(request))
+        }
+        defer {
+            requestTask.cancel()
+            requestContinuation.finish()
+        }
+        do {
+            try await withinDeadline {
+                var iterator = entered.makeAsyncIterator()
+                try #require(await iterator.next() != nil)
+            }
+            #expect(await transport.httpRequestContext(for: "r")?.path == "/original")
+
+            let (deliveries, deliveryContinuation) = AsyncStream<HTTPResponse>.makeStream()
+            let deliveryBody = try invalidResponse(id: "r", member: member)
+            let deliveryTask = Task {
+                deliveryContinuation.yield(await post(HTTPRequest(
+                    method: "POST", headers: httpHeaders, body: deliveryBody, path: "/delivery")))
+            }
+            defer {
+                deliveryTask.cancel()
+                deliveryContinuation.finish()
+            }
+            let acknowledgement = try await withinDeadline {
+                var iterator = deliveries.makeAsyncIterator()
+                return try #require(await iterator.next())
+            }
+            #expect(acknowledgement.statusCode == 202)
+            #expect(acknowledgement.bodyData == nil)
+            #expect(await transport.httpRequestContext(for: "r")?.path == "/original")
+
+            releaseContinuation.yield(())
+            let response = try await withinDeadline {
+                var iterator = requests.makeAsyncIterator()
+                return try #require(await iterator.next())
+            }
+            let messages = try await completedHTTPMessages(response)
+            try #require(messages.count == 1)
+            let wire = try JSONDecoder().decode(Response<CallTool>.self, from: #require(messages.first))
+            #expect(wire.id == "r")
+            #expect(try wire.result.get().content == [.text(text: "ok", annotations: nil, _meta: nil)])
+            #expect(await transport.httpRequestContext(for: "r") == nil)
+            await server.stop()
+        } catch {
+            await server.stop()
+            throw error
+        }
     }
 
     @Test("HTTP errors complete the carrying POST or request stream", arguments: errorCases)
@@ -409,6 +534,31 @@ private func makeServer() async -> Server {
 }
 
 private func stdioExchange(_ raw: String, responseCount: Int) async throws -> [Data] {
+    try await withStdioServer { _, client in
+        try await client.send(Data(raw.utf8))
+        // The server processes non-request messages before this request. Its
+        // reply establishes progress without a timed "no response" assertion.
+        try await client.send(Data(#"{"jsonrpc":"2.0","id":"barrier","method":"ping"}"#.utf8))
+        let frames = try await withinDeadline {
+            var frames: [Data] = []
+            for try await frame in await client.receive() {
+                frames.append(frame)
+                if frames.count == responseCount + 1 { break }
+            }
+            return frames
+        }
+        let replies = frames.filter { frame in
+            (try? JSONDecoder().decode(WireResponse.self, from: frame).id) != .string("barrier")
+        }
+        #expect(frames.count == responseCount + 1)
+        #expect(replies.count == responseCount)
+        return replies
+    }
+}
+
+private func withStdioServer<T>(
+    _ operation: (Server, StdioTransport) async throws -> T
+) async throws -> T {
     let (input, writer) = try FileDescriptor.pipe()
     let (reader, output) = try FileDescriptor.pipe()
     defer {
@@ -420,31 +570,20 @@ private func stdioExchange(_ raw: String, responseCount: Int) async throws -> [D
     do {
         try await server.start(transport: serverTransport)
         try await client.connect()
-        try await client.send(Data(raw.utf8))
-        // The server processes invalid notifications before this request. Its
-        // reply establishes progress without a timed "no response" assertion.
-        try await client.send(Data(#"{"jsonrpc":"2.0","id":"barrier","method":"ping"}"#.utf8))
-        let frames = try await withinDeadline {
-            var frames: [Data] = []
-            for try await frame in await client.receive() {
-                frames.append(frame)
-                if frames.count == responseCount + 1 { break }
-            }
-            return frames
-        }
+        let result = try await operation(server, client)
         await server.stop()
         await client.disconnect()
-        let replies = frames.filter { frame in
-            (try? JSONDecoder().decode(WireResponse.self, from: frame).id) != .string("barrier")
-        }
-        #expect(frames.count == responseCount + 1)
-        #expect(replies.count == responseCount)
-        return replies
+        return result
     } catch {
         await server.stop()
         await client.disconnect()
         throw error
     }
+}
+
+private func invalidResponse(id: ID, member: String) throws -> Data {
+    let encodedID = String(decoding: try JSONEncoder().encode(id), as: UTF8.self)
+    return Data(#"{"jsonrpc":"2.0","id":\#(encodedID),\#(member)}"#.utf8)
 }
 
 private func withHTTPServer(
