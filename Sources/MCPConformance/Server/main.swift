@@ -181,7 +181,7 @@ func createConformanceServer(state: ServerState, transport: StatefulHTTPServerTr
             // The client should reconnect via GET with Last-Event-ID and receive the
             // response on the new stream.
             if let requestID = Server.currentHandlerContext?.id {
-                await transport.closeSSEStream(forRequestID: requestID.description)
+                await transport.closeSSEStream(forRequestID: requestID)
             }
             // Wait briefly for the client to reconnect before sending the response.
             try await Task.sleep(for: .milliseconds(100))
